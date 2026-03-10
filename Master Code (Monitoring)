@@ -1,0 +1,148 @@
+#include <esp_now.h>
+#include <WiFi.h>
+
+// ================================================================
+// KONFIGURASI MASTER
+// ================================================================
+// MAC ADDRESS SLAVE (DRONE) - Pastikan ini benar!
+uint8_t slaveAddress[] = {0x24, 0xDC, 0xC3, 0x44, 0x31, 0x64};
+
+enum MessageType {
+  TELEMETRY_DATA = 1,
+  PID_UPDATE = 2
+};
+
+typedef struct struct_message {
+  uint8_t msgType;
+  int throttle;
+  int motor1; int motor2; int motor3; int motor4;
+  int rx1; int rx2; int rx3; int rx4;
+  float roll; float pitch;
+  
+  // Data PID
+  float P_Angle, I_Angle, D_Angle;
+  float P_Rate,  I_Rate,  D_Rate;
+} struct_message;
+
+struct_message incomingData;
+struct_message dataToSend;
+
+volatile bool newData = false;
+
+// Simpan nilai PID terakhir di Master agar bisa ditampilkan
+// (Nilai awal disamakan dengan default Slave)
+float currentPAngle=5.0, currentIAngle=0.0, currentDAngle=0.0;
+float currentPRate=1.0,  currentIRate=0.0,  currentDRate=0.0;
+
+// Callback saat data diterima dari Drone
+void OnDataRecv(const esp_now_recv_info_t * info, const uint8_t *data, int len) {
+  if (len == sizeof(incomingData)) {
+    memcpy(&incomingData, data, sizeof(incomingData));
+    if (incomingData.msgType == TELEMETRY_DATA) {
+      newData = true;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW Init Failed");
+    return;
+  }
+  
+  esp_now_register_recv_cb(OnDataRecv);
+  
+  // Register Peer (Slave)
+  esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, slaveAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Failed to add peer");
+  }
+  
+  Serial.println("\n=== GROUND STATION READY ===");
+  Serial.println("COMMANDS:");
+  Serial.println("  Angle PID:  A [P] [I] [D]");
+  Serial.println("  Rate PID:   R [P] [I] [D]");
+  Serial.println("============================\n");
+}
+
+void loop() {
+  // 1. PROSES INPUT SERIAL (UBAH PID)
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    
+    float p, i, d;
+    bool validCommand = false;
+    
+    if (input.startsWith("A ")) { // Update Angle
+      if (sscanf(input.c_str(), "A %f %f %f", &p, &i, &d) == 3) {
+        currentPAngle = p; currentIAngle = i; currentDAngle = d;
+        validCommand = true;
+        Serial.println(">> Sending Angle PID Update...");
+      }
+    } else if (input.startsWith("R ")) { // Update Rate
+      if (sscanf(input.c_str(), "R %f %f %f", &p, &i, &d) == 3) {
+        currentPRate = p; currentIRate = i; currentDRate = d;
+        validCommand = true;
+        Serial.println(">> Sending Rate PID Update...");
+      }
+    }
+    
+    if (validCommand) {
+      dataToSend.msgType = PID_UPDATE;
+      dataToSend.P_Angle = currentPAngle;
+      dataToSend.I_Angle = currentIAngle;
+      dataToSend.D_Angle = currentDAngle;
+      dataToSend.P_Rate  = currentPRate;
+      dataToSend.I_Rate  = currentIRate;
+      dataToSend.D_Rate  = currentDRate;
+      
+      esp_now_send(slaveAddress, (uint8_t *) &dataToSend, sizeof(dataToSend));
+    }
+  }
+
+  // 2. TAMPILKAN DATA TELEMETRY (DASHBOARD)
+  if (newData) {
+    newData = false;
+    
+    // Baris 1: Status Terbang
+    Serial.print("THR: "); Serial.print(incomingData.throttle);
+    Serial.print(" Roll: "); Serial.print(incomingData.roll, 1);
+    Serial.print(" Pitch: "); Serial.print(incomingData.pitch, 1);
+    
+    // Baris 2: Menampilkan MURNI NILAI PID (Motor Output dikurangi Throttle)
+    Serial.print(" | ");
+    
+    // Kita cek apakah Throttle aktif. Jika di bawah 1080 (Cutoff),
+    // kita asumsikan PID murni adalah 0 agar tampilannya rapi.
+    int pid_m1 = 0, pid_m2 = 0, pid_m3 = 0, pid_m4 = 0;
+    
+    if (incomingData.throttle >= 1080) {
+      pid_m1 = incomingData.motor1 - incomingData.throttle;
+      pid_m2 = incomingData.motor2 - incomingData.throttle;
+      pid_m3 = incomingData.motor3 - incomingData.throttle;
+      pid_m4 = incomingData.motor4 - incomingData.throttle;
+    }
+    
+    Serial.print("PID_M1: "); Serial.print(pid_m1);
+    Serial.print(" PID_M2: "); Serial.print(pid_m2);
+    Serial.print(" PID_M3: "); Serial.print(pid_m3);
+    Serial.print(" PID_M4: "); Serial.print(pid_m4);
+    
+    // Baris 3: Info PID Saat Ini
+    Serial.print(" | ");
+    Serial.print("ANG( "); Serial.print(currentPAngle,3); Serial.print(" "); 
+    Serial.print(currentIAngle,3); Serial.print(" "); Serial.print(currentDAngle,3); Serial.print(" )  ");
+    
+    Serial.print("RT( "); Serial.print(currentPRate,3); Serial.print(" "); 
+    Serial.print(currentIRate,3); Serial.print(" "); Serial.print(currentDRate,4); Serial.println(" )");
+  }
+}
