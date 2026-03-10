@@ -1,0 +1,471 @@
+/**
+ * SLAVE CODE (DRONE) - FINAL VERSION
+ * Features: ESP-NOW Telemetry, Remote PID Tuning, Auto-Calibration, Deadband
+ */
+
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <Arduino.h>
+#include <driver/ledc.h>
+#include <soc/ledc_struct.h>
+
+// ================================================================
+// 1. KONFIGURASI ESP-NOW & STRUKTUR DATA
+// ================================================================
+// MAC Address Master (Ground Station) - Sesuaikan jika perlu
+uint8_t masterAddress[] = {0x10, 0x51, 0xDB, 0x7E, 0x82, 0x78};
+
+// Tipe Pesan (Wajib sama dengan Master)
+enum MessageType {
+  TELEMETRY_DATA = 1,
+  PID_UPDATE = 2
+};
+
+typedef struct struct_message {
+  uint8_t msgType; // 1=Telemetry, 2=PID Update
+  
+  // Data Telemetry (Slave -> Master)
+  int throttle;
+  int motor1; int motor2; int motor3; int motor4;
+  int rx1; int rx2; int rx3; int rx4;
+  float roll; float pitch;
+  
+  // Data PID (Master -> Slave)
+  float P_Angle, I_Angle, D_Angle;
+  float P_Rate,  I_Rate,  D_Rate;
+} struct_message;
+
+struct_message myData; // Buffer untuk pengiriman/penerimaan
+esp_now_peer_info_t peerInfo;
+
+// ================================================================
+// 2. DEFINISI PIN & KONFIGURASI HARDWARE
+// ================================================================
+const int PWM_PIN_M1 = 13; // Depan Kanan
+const int PWM_PIN_M2 = 4;  // Belakang Kanan
+const int PWM_PIN_M3 = 14; // Belakang Kiri
+const int PWM_PIN_M4 = 27; // Depan Kiri
+
+// Pin Receiver (Ch1-Ch6)
+const int channel_pins[6] = {19, 18, 32, 33, 25, 26}; 
+
+const int PWM_FREQUENCY = 250; 
+const int PWM_RESOLUTION = 12; 
+
+// ================================================================
+// 3. VARIABEL GLOBAL
+// ================================================================
+volatile uint32_t current_time;
+volatile uint32_t last_channel[6] = {0,0,0,0,0,0};
+volatile uint32_t timer[6] = {0,0,0,0,0,0};
+volatile int ReceiverValue[6] = {1500, 1500, 1000, 1500, 1000, 1000}; 
+
+volatile float MotorInput1=1000, MotorInput2=1000, MotorInput3=1000, MotorInput4=1000;
+volatile float InputThrottle=1000;
+
+float RateRoll, RatePitch, RateYaw;
+float RateCalibrationRoll, RateCalibrationPitch, RateCalibrationYaw;
+float AccXCalibration, AccYCalibration, AccZCalibration; // Kalibrasi Accel
+int   RateCalibrationNumber;
+float AccX, AccY, AccZ;
+float AngleRoll, AnglePitch;
+float LoopTimer;
+
+float DesiredRateRoll, DesiredRatePitch, DesiredRateYaw;
+float ErrorRateRoll, ErrorRatePitch, ErrorRateYaw;
+float InputRoll, InputPitch, InputYaw;
+float PrevErrorRateRoll, PrevErrorRatePitch, PrevErrorRateYaw;
+float PrevItermRateRoll, PrevItermRatePitch, PrevItermRateYaw;
+float PIDReturn[]={0, 0, 0};
+
+// --- PID PARAMETERS (Default) ---
+// Nilai ini bisa berubah jika Master mengirim update
+float PAngleRoll=5.0; float PAnglePitch=PAngleRoll;
+float IAngleRoll=0.0; float IAnglePitch=IAngleRoll;
+float DAngleRoll=0.0; float DAnglePitch=DAngleRoll;
+
+float PRateRoll=1.0;  float PRatePitch=PRateRoll;  float PRateYaw=0.0;
+float IRateRoll=0.0;  float IRatePitch=IRateRoll;  float IRateYaw=0.0;
+float DRateRoll=0.0; float DRatePitch=DRateRoll;  float DRateYaw=0.0;
+
+float KalmanAngleRoll=0, KalmanUncertaintyAngleRoll=4;
+float KalmanAnglePitch=0, KalmanUncertaintyAnglePitch=4;
+float Kalman1DOutput[]={0,0};
+
+float DesiredAngleRoll, DesiredAnglePitch;
+float ErrorAngleRoll, ErrorAnglePitch;
+float PrevErrorAngleRoll, PrevErrorAnglePitch;
+float PrevItermAngleRoll, PrevItermAnglePitch;
+
+// ================================================================
+// 4. ESP-NOW CALLBACKS
+// ================================================================
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
+
+// Callback saat Menerima Data PID dari Master
+void OnDataRecv(const esp_now_recv_info_t * info, const uint8_t *incomingData, int len) {
+  if (len == sizeof(myData)) {
+    struct_message incoming;
+    memcpy(&incoming, incomingData, sizeof(incoming));
+    
+    // Cek jika ini adalah perintah Update PID
+    if (incoming.msgType == PID_UPDATE) {
+      // Update variabel global secara instan
+      PAngleRoll = incoming.P_Angle; PAnglePitch = incoming.P_Angle;
+      IAngleRoll = incoming.I_Angle; IAnglePitch = incoming.I_Angle;
+      DAngleRoll = incoming.D_Angle; DAnglePitch = incoming.D_Angle;
+      
+      PRateRoll = incoming.P_Rate; PRatePitch = incoming.P_Rate;
+      IRateRoll = incoming.I_Rate; IRatePitch = incoming.I_Rate;
+      DRateRoll = incoming.D_Rate; DRatePitch = incoming.D_Rate;
+      
+      // Indikator visual (Kedipkan LED bawaan jika ada)
+      digitalWrite(2, !digitalRead(2));
+    }
+  }
+}
+
+// ================================================================
+// 5. FUNGSI PENDUKUNG (Sensor, Interrupt, PID)
+// ================================================================
+
+void IRAM_ATTR channelInterruptHandler() {
+  current_time = micros();
+  for(int i=0; i<6; i++) {
+    if (digitalRead(channel_pins[i])) {
+      if (last_channel[i] == 0) {
+        last_channel[i] = 1;
+        timer[i] = current_time;
+      }
+    } else if (last_channel[i] == 1) {
+      last_channel[i] = 0;
+      long input_pulse = current_time - timer[i];
+      // Filter Glitch: Hanya terima sinyal masuk akal (900-2100us)
+      if (input_pulse > 900 && input_pulse < 2100) {
+        ReceiverValue[i] = input_pulse;
+      }
+    }
+  }
+}
+
+void kalman_1d(float KalmanState,float KalmanUncertainty, float KalmanInput, float KalmanMeasurement) {
+   KalmanState=KalmanState+0.004*KalmanInput;
+   KalmanUncertainty=KalmanUncertainty + 0.004* 0.004 * 4 * 4;
+   float KalmanGain=KalmanUncertainty * 1/(1*KalmanUncertainty + 3 * 3);
+   KalmanState=KalmanState+KalmanGain * (KalmanMeasurement-KalmanState);
+   KalmanUncertainty=(1-KalmanGain) *KalmanUncertainty;
+   Kalman1DOutput[0]=KalmanState;
+   Kalman1DOutput[1]=KalmanUncertainty;
+}
+
+void reset_pid(void) {  
+   PrevErrorRateRoll=0; PrevErrorRatePitch=0; PrevErrorRateYaw=0;
+   PrevItermRateRoll=0; PrevItermRatePitch=0; PrevItermRateYaw=0;
+   PrevErrorAngleRoll=0; PrevErrorAnglePitch=0; 
+   PrevItermAngleRoll=0; PrevItermAnglePitch=0; 
+}
+
+// ================================================================
+// FUNGSI PWM SUPER CEPAT (MENGGUNAKAN HIGH SPEED MODE)
+// ================================================================
+void pwmsetup() {
+    // 1. Konfigurasi Mesin Timer menggunakan HIGH SPEED MODE
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_HIGH_SPEED_MODE, // <-- Diubah ke HIGH
+        .duty_resolution  = LEDC_TIMER_12_BIT,
+        .timer_num        = LEDC_TIMER_0,
+        .freq_hz          = 250,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&ledc_timer);
+
+    // 2. Sambungkan Pin Motor secara permanen
+    ledc_channel_config_t ledc_channel[4] = {
+        { .gpio_num = PWM_PIN_M1, .speed_mode = LEDC_HIGH_SPEED_MODE, .channel = LEDC_CHANNEL_0, .intr_type = LEDC_INTR_DISABLE, .timer_sel = LEDC_TIMER_0, .duty = 1000, .hpoint = 0 },
+        { .gpio_num = PWM_PIN_M2, .speed_mode = LEDC_HIGH_SPEED_MODE, .channel = LEDC_CHANNEL_1, .intr_type = LEDC_INTR_DISABLE, .timer_sel = LEDC_TIMER_0, .duty = 1000, .hpoint = 0 },
+        { .gpio_num = PWM_PIN_M3, .speed_mode = LEDC_HIGH_SPEED_MODE, .channel = LEDC_CHANNEL_2, .intr_type = LEDC_INTR_DISABLE, .timer_sel = LEDC_TIMER_0, .duty = 1000, .hpoint = 0 },
+        { .gpio_num = PWM_PIN_M4, .speed_mode = LEDC_HIGH_SPEED_MODE, .channel = LEDC_CHANNEL_3, .intr_type = LEDC_INTR_DISABLE, .timer_sel = LEDC_TIMER_0, .duty = 1000, .hpoint = 0 }
+    };
+    for(int i=0; i<4; i++) ledc_channel_config(&ledc_channel[i]);
+}
+
+void fast_pwmwrite(ledc_channel_t channel, int input_val) {
+    if(input_val > 4095) input_val = 4095;
+        // 1. Siapkan nilainya ke dalam memori channel (Tidak memblokir)
+    ledc_set_duty(LEDC_HIGH_SPEED_MODE, channel, input_val);
+        // 2. TRIGGER INSTAN: Paksa hardware mengirim sinyal sekarang juga tanpa antre!
+    // Catatan: LEDC_HIGH_SPEED_MODE berada di channel_group[0]
+    LEDC.channel_group[0].channel[channel].conf1.duty_start = 1;
+}
+
+void pid_equation(float Error, float P , float I, float D, float PrevError, float PrevIterm) {
+   float Pterm=P*Error;
+   float Iterm=PrevIterm+I*(Error+PrevError)*0.004/2;
+   if (Iterm > 400) Iterm=400; else if (Iterm <-400) Iterm=-400;
+   float Dterm=D*(Error-PrevError)/0.004;
+   float PIDOutput= Pterm+Iterm+Dterm;
+   if (PIDOutput>400) PIDOutput=400; else if (PIDOutput <-400) PIDOutput=-400;
+   PIDReturn[0]=PIDOutput; PIDReturn[1]=Error; PIDReturn[2]=Iterm;
+}
+
+void gyro_signals(void) { 
+    Wire.beginTransmission(0x68); 
+    Wire.write(0x3B); 
+    Wire.endTransmission();
+    Wire.requestFrom(0x68, 14); // Minta 14 byte (Accel + Temp + Gyro)
+    
+    // Harus dibaca berurutan sesuai peta memori MPU9250
+    int16_t AccXLSB = Wire.read() << 8 | Wire.read();
+    int16_t AccYLSB = Wire.read() << 8 | Wire.read();
+    int16_t AccZLSB = Wire.read() << 8 | Wire.read();
+    
+    int16_t TempLSB = Wire.read() << 8 | Wire.read(); // Data suhu (kita baca tapi tidak dipakai)
+    
+    int16_t GyroX = Wire.read() << 8 | Wire.read();
+    int16_t GyroY = Wire.read() << 8 | Wire.read();
+    int16_t GyroZ = Wire.read() << 8 | Wire.read();
+    
+    // --- KALKULASI ---
+    RateRoll=(float)GyroX/65.5; 
+    RatePitch=(float)GyroY/65.5; 
+    RateYaw=(float)GyroZ/65.5;
+    
+    AccX=(float)AccXLSB/4096 - AccXCalibration; 
+    AccY=(float)AccYLSB/4096 - AccYCalibration; 
+    AccZ=(float)AccZLSB/4096 - AccZCalibration; 
+    
+    AngleRoll=atan(AccY/sqrt(AccX*AccX+AccZ*AccZ))*57.296;
+    AnglePitch=-atan(AccX/sqrt(AccY*AccY+AccZ*AccZ))*57.296;
+}
+
+// === FUNGSI KALIBRASI TOTAL ===
+void calibrate_sensor() {
+    Serial.println("Calibrating Gyro & Accel... KEEP LEVEL!");
+    RateCalibrationRoll=0; RateCalibrationPitch=0; RateCalibrationYaw=0;
+    AccXCalibration=0; AccYCalibration=0; AccZCalibration=0;
+    
+    for(RateCalibrationNumber=0; RateCalibrationNumber<2000; RateCalibrationNumber++) {
+        Wire.beginTransmission(0x68); Wire.write(0x3B); Wire.endTransmission();
+        Wire.requestFrom(0x68,14);
+        int16_t AccXLSB = Wire.read() << 8 | Wire.read();
+        int16_t AccYLSB = Wire.read() << 8 | Wire.read();
+        int16_t AccZLSB = Wire.read() << 8 | Wire.read();
+        int16_t TempLSB = Wire.read() << 8 | Wire.read(); // Data suhu (kita baca tapi tidak dipakai)
+        int16_t GyroX = Wire.read() << 8 | Wire.read();
+        int16_t GyroY = Wire.read() << 8 | Wire.read();
+        int16_t GyroZ = Wire.read() << 8 | Wire.read();
+        
+        RateCalibrationRoll += (float)GyroX/65.5;
+        RateCalibrationPitch += (float)GyroY/65.5;
+        RateCalibrationYaw += (float)GyroZ/65.5;
+        
+        AccXCalibration += (float)AccXLSB/4096;
+        AccYCalibration += (float)AccYLSB/4096;
+        AccZCalibration += (float)AccZLSB/4096;
+        delay(1);
+    }
+    
+    RateCalibrationRoll /= 2000;
+    RateCalibrationPitch /= 2000;
+    RateCalibrationYaw /= 2000;
+    
+    AccXCalibration /= 2000;
+    AccYCalibration /= 2000;
+    AccZCalibration /= 2000;
+    AccZCalibration -= 1.0; // Koreksi Gravitasi Z agar terbaca 1G
+    
+    Serial.println("Calibration Done.");
+}
+
+// ================================================================
+// 6. TASK 1: FLIGHT CONTROL
+// ================================================================
+void flightControlTask(void *pvParameters) {
+    while(1) {
+        // 1. BACA SENSOR
+        gyro_signals(); 
+        
+        // 2. MATEMATIKA & PID
+        RateRoll-=RateCalibrationRoll; RatePitch-=RateCalibrationPitch; RateYaw-=RateCalibrationYaw;
+        kalman_1d(KalmanAngleRoll, KalmanUncertaintyAngleRoll, RateRoll, AngleRoll);
+        KalmanAngleRoll=Kalman1DOutput[0]; KalmanUncertaintyAngleRoll=Kalman1DOutput[1];
+        kalman_1d(KalmanAnglePitch,KalmanUncertaintyAnglePitch, RatePitch, AnglePitch);
+        KalmanAnglePitch=Kalman1DOutput[0]; KalmanUncertaintyAnglePitch=Kalman1DOutput[1];
+
+        int rawThrottle = ReceiverValue[2];
+        int rawRoll     = ReceiverValue[0];
+        int rawPitch    = ReceiverValue[1];
+        int rawYaw      = ReceiverValue[3];
+
+        if (abs(rawRoll - 1500) < 15)  rawRoll = 1500;
+        if (abs(rawPitch - 1500) < 15) rawPitch = 1500;
+        if (abs(rawYaw - 1500) < 15)   rawYaw = 1500;
+
+        InputThrottle = rawThrottle;
+        
+        DesiredAngleRoll  = 0.10 * (rawRoll - 1500);
+        DesiredAnglePitch = 0.10 * (rawPitch - 1500);
+        DesiredRateYaw    = 0.15 * (rawYaw - 1500);
+
+        ErrorAngleRoll=DesiredAngleRoll-KalmanAngleRoll;
+        ErrorAnglePitch=DesiredAnglePitch-KalmanAnglePitch;
+        
+        pid_equation(ErrorAngleRoll, PAngleRoll, IAngleRoll, DAngleRoll, PrevErrorAngleRoll, PrevItermAngleRoll);
+        DesiredRateRoll=PIDReturn[0]; PrevErrorAngleRoll=PIDReturn[1]; PrevItermAngleRoll=PIDReturn[2];
+
+        pid_equation(ErrorAnglePitch, PAnglePitch, IAnglePitch, DAnglePitch, PrevErrorAnglePitch, PrevItermAnglePitch);
+        DesiredRatePitch=PIDReturn[0]; PrevErrorAnglePitch=PIDReturn[1]; PrevItermAnglePitch=PIDReturn[2];
+        
+        ErrorRateRoll=DesiredRateRoll-RateRoll;
+        ErrorRatePitch=DesiredRatePitch-RatePitch;
+        ErrorRateYaw=DesiredRateYaw-RateYaw;
+
+        pid_equation(ErrorRateRoll, PRateRoll, IRateRoll, DRateRoll, PrevErrorRateRoll, PrevItermRateRoll);
+        InputRoll=PIDReturn[0]; PrevErrorRateRoll=PIDReturn[1]; PrevItermRateRoll=PIDReturn[2];
+
+        pid_equation(ErrorRatePitch, PRatePitch, IRatePitch, DRatePitch, PrevErrorRatePitch, PrevItermRatePitch);
+        InputPitch=PIDReturn[0]; PrevErrorRatePitch=PIDReturn[1]; PrevItermRatePitch=PIDReturn[2];
+
+        pid_equation(ErrorRateYaw, PRateYaw, IRateYaw, DRateYaw, PrevErrorRateYaw, PrevItermRateYaw);
+        InputYaw=PIDReturn[0]; PrevErrorRateYaw=PIDReturn[1]; PrevItermRateYaw=PIDReturn[2];
+
+        InputRoll = 0.0;
+        InputYaw = 0.0;
+
+        // 3. MIXING MOTOR
+        if (InputThrottle > 2000) InputThrottle = 2000;
+        if (InputThrottle < 1000) InputThrottle = 1000;
+        
+        MotorInput1= 1.024*(InputThrottle-InputRoll-InputPitch-InputYaw);
+        MotorInput2= 1.024*(InputThrottle+InputRoll-InputPitch+InputYaw);
+        MotorInput3= 1.024*(InputThrottle+InputRoll+InputPitch-InputYaw);
+        MotorInput4= 1.024*(InputThrottle-InputRoll+InputPitch+InputYaw);
+
+        if (MotorInput1 > 2000) MotorInput1 = 1989;
+        if (MotorInput2 > 2000) MotorInput2 = 1989;
+        if (MotorInput3 > 2000) MotorInput3 = 1989;
+        if (MotorInput4 > 2000) MotorInput4 = 1989;
+
+        int ThrottleIdle=1100;
+        if (MotorInput1 < ThrottleIdle) MotorInput1 = ThrottleIdle;
+        if (MotorInput2 < ThrottleIdle) MotorInput2 = ThrottleIdle;
+        if (MotorInput3 < ThrottleIdle) MotorInput3 = ThrottleIdle;
+        if (MotorInput4 < ThrottleIdle) MotorInput4 = ThrottleIdle;
+
+        int ThrottleCutOff=1000;
+        if (InputThrottle < 1080) { 
+           MotorInput1=ThrottleCutOff; MotorInput2=ThrottleCutOff;
+           MotorInput3=ThrottleCutOff; MotorInput4=ThrottleCutOff;
+           reset_pid();
+        }
+
+        // --- FAILSAFE TEST RIG ---
+        // Jika kemiringan Roll atau Pitch lebih dari 45 derajat
+        if (abs(KalmanAngleRoll) > 45.0 || abs(KalmanAnglePitch) > 45.0) {
+           MotorInput1=ThrottleCutOff; MotorInput2=ThrottleCutOff;
+           MotorInput3=ThrottleCutOff; MotorInput4=ThrottleCutOff;
+           reset_pid(); // Cegah PID Windup saat tertahan di rig
+        }
+        
+        // 4. TULIS PWM (HARDWARE BYPASS)
+        fast_pwmwrite(LEDC_CHANNEL_0, MotorInput1);  
+        fast_pwmwrite(LEDC_CHANNEL_1, MotorInput2); 
+        fast_pwmwrite(LEDC_CHANNEL_2, MotorInput3); 
+        fast_pwmwrite(LEDC_CHANNEL_3, MotorInput4);
+        
+        // 5. JAGA FREKUENSI LOOP 250Hz (4000 us)
+        while ((micros() - LoopTimer) < 4000);
+        LoopTimer=micros();
+    }
+}
+
+// ================================================================
+// 7. TASK 2: TELEMETRY (SEND DATA TO MASTER)
+// ================================================================
+void telemetryTask(void *pvParameters) {
+    while(1) {
+        myData.msgType = TELEMETRY_DATA;
+        myData.throttle = (int)InputThrottle;
+        myData.motor1 = (int)MotorInput1;
+        myData.motor2 = (int)MotorInput2;
+        myData.motor3 = (int)MotorInput3;
+        myData.motor4 = (int)MotorInput4;
+        
+        myData.rx1 = ReceiverValue[0];
+        myData.rx2 = ReceiverValue[1];
+        myData.rx3 = ReceiverValue[2];
+        myData.rx4 = ReceiverValue[3];
+        
+        myData.roll = KalmanAngleRoll;
+        myData.pitch = KalmanAnglePitch;
+        
+        esp_now_send(masterAddress, (uint8_t *)&myData, sizeof(myData));
+        vTaskDelay(100 / portTICK_PERIOD_MS); 
+    }
+}
+
+// ================================================================
+// 8. SETUP UTAMA
+// ================================================================
+void setup()  
+{
+    Serial.begin(115200); 
+    pinMode(2, OUTPUT); // LED Status
+    
+    Serial.println("\n=== DRONE READY ===");
+    
+    WiFi.mode(WIFI_STA);
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("ESP-NOW Error");
+        return;
+    }
+    
+    // Register Callbacks dengan Casting (Solusi ESP32 v3.0)
+    esp_now_register_send_cb((esp_now_send_cb_t)OnDataSent);
+    esp_now_register_recv_cb((esp_now_recv_cb_t)OnDataRecv); 
+    
+    memset(&peerInfo, 0, sizeof(peerInfo));
+    memcpy(peerInfo.peer_addr, masterAddress, 6);
+    peerInfo.channel = 0;  
+    peerInfo.encrypt = false;
+    
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Peer Add Failed");
+    }
+    
+    for(int i=0; i<6; i++) {
+      pinMode(channel_pins[i], INPUT_PULLUP);
+      attachInterrupt(digitalPinToInterrupt(channel_pins[i]), channelInterruptHandler, CHANGE);
+    }
+    
+    Wire.setClock(400000); 
+    Wire.begin(); 
+    delay(250);
+    
+    // Menyalakan MPU9250
+    Wire.beginTransmission(0x68); Wire.write(0x6B); Wire.write(0x00); Wire.endTransmission();
+    // Konfigurasi Low Pass Filter Gyro
+    Wire.beginTransmission(0x68); Wire.write(0x1A); Wire.write(0x03); Wire.endTransmission();
+    // Konfigurasi Skala Accelerometer (8g)
+    Wire.beginTransmission(0x68); Wire.write(0x1C); Wire.write(0x10); Wire.endTransmission();
+    // Konfigurasi Low Pass Filter Accelerometer (Register khusus MPU9250/MPU6500)
+    Wire.beginTransmission(0x68); Wire.write(0x1D); Wire.write(0x03); Wire.endTransmission();
+    // Konfigurasi Skala Gyroscope (500 deg/s)
+    Wire.beginTransmission(0x68); Wire.write(0x1B); Wire.write(0x08); Wire.endTransmission(); 
+    // -----------------------------------------------------------
+    
+    // Auto Kalibrasi
+    calibrate_sensor();
+    
+    pwmsetup();
+    LoopTimer=micros();
+
+    // Buat 2 Task (Terbang & Telemetry)
+    xTaskCreatePinnedToCore(flightControlTask, "FlightCtrl", 8192, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(telemetryTask, "Telemetry", 4096, NULL, 1, NULL, 0);
+}
+
+void loop() { 
+    vTaskDelete(NULL); 
+}
