@@ -1,9 +1,10 @@
+/*
+  MASTER CODE - FLIGHT CONTROLLER
+*/
+
 #include <esp_now.h>
 #include <WiFi.h>
 
-// ================================================================
-// KONFIGURASI MASTER
-// ================================================================
 // MAC ADDRESS SLAVE (DRONE) - Pastikan ini benar!
 uint8_t slaveAddress[] = {0x24, 0xDC, 0xC3, 0x44, 0x31, 0x64};
 
