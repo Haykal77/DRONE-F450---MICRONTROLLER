@@ -64,7 +64,7 @@ PIDController pidAnglePitch(3.0, 0.05, 0.015, 200.0);
 // Rate PID (Batas 150) - P diturunkan, D diberi redaman sedikit
 PIDController pidRateRoll(2, 0.1, 0.025, 200.0);   
 PIDController pidRatePitch(2, 0.1, 0.025, 200.0);  
-PIDController pidRateYaw(1.5, 0.0, 0.05, 200.0);       
+PIDController pidRateYaw(2.0, 1.5, 0.0, 200.0);       
 
 // ================================================================
 // 3. HARDWARE & VARIABEL
