@@ -1,5 +1,5 @@
 /**
- * SLAVE CODE: Unified Roll/Pitch PID & Corrected Mixer
+ * SLAVE CODE
  */
 
 #include <esp_now.h>
@@ -39,7 +39,7 @@ enum MessageType { TELEMETRY_DATA = 1, PID_UPDATE = 2 };
 
 typedef struct struct_message {
     uint8_t msgType; 
-    uint8_t padding[3]; // Mencegah memory mismatch
+    uint8_t padding[3]; 
     
     int throttle;
     int motor1; int motor2; int motor3; int motor4;
@@ -55,15 +55,13 @@ struct_message myData;
 esp_now_peer_info_t peerInfo;
 
 // ================================================================
-// 2. INSTANSIASI PID (Nilai Default Aman untuk Hover)
+// 2. INSTANSIASI PID (Rate D mungkin perlu diturunkan di lapangan)
 // ================================================================
-// Angle PID (Batas 200 deg/s) - P diturunkan agar stik lebih kalem
-PIDController pidAngleRoll(3.0, 0.05, 0.015, 200.0);  
-PIDController pidAnglePitch(3.0, 0.05, 0.015, 200.0); 
+PIDController pidAngleRoll(3.5, 0.0, 0.015, 200.0);  
+PIDController pidAnglePitch(3.5, 0.0, 0.015, 200.0); 
 
-// Rate PID (Batas 150) - P diturunkan, D diberi redaman sedikit
-PIDController pidRateRoll(2, 0.1, 0.025, 200.0);   
-PIDController pidRatePitch(2, 0.1, 0.025, 200.0);  
+PIDController pidRateRoll(2.0, 0.2, 0.045, 200.0);   
+PIDController pidRatePitch(2.0, 0.2, 0.045, 200.0);  
 PIDController pidRateYaw(2.0, 1.5, 0.0, 200.0);       
 
 // ================================================================
@@ -97,13 +95,11 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
 
 void OnDataRecv(const esp_now_recv_info_t * info, const uint8_t *incomingData, int len) {
     if (incomingData[0] == PID_UPDATE) {
-        // Cek ukuran secara langsung di Serial Monitor
         if (len != sizeof(struct_message)) {
-            Serial.printf("\n[DITOLAK] Ukuran meleset! Diterima: %d bytes, Seharusnya: %d bytes\n", len, sizeof(struct_message));
-            return; // Buang pesan
+            Serial.printf("\n[DITOLAK] Ukuran meleset! Diterima: %d bytes\n", len);
+            return; 
         }
         
-        // 2. Jika lolos validasi, terapkan pembaruan
         struct_message incoming;
         memcpy(&incoming, incomingData, sizeof(incoming));
         
@@ -137,11 +133,12 @@ void IRAM_ATTR channelInterruptHandler() {
 }
 
 // ================================================================
-// 5. SENSOR & HARDWARE PWM
+// 5. SENSOR & HARDWARE PWM (Disesuaikan Mutlak untuk 500 Hz)
 // ================================================================
 void kalman_1d(float KalmanState, float KalmanUncertainty, float KalmanInput, float KalmanMeasurement) {
-    KalmanState = KalmanState + 0.004f * KalmanInput;
-    KalmanUncertainty = KalmanUncertainty + 0.004f * 0.004f * 16.0f;
+    // dt untuk 500 Hz adalah 0.002 detik (1 / 500)
+    KalmanState = KalmanState + 0.002f * KalmanInput;
+    KalmanUncertainty = KalmanUncertainty + 0.002f * 0.002f * 16.0f;
     float KalmanGain = KalmanUncertainty / (KalmanUncertainty + 9.0f);
     KalmanState = KalmanState + KalmanGain * (KalmanMeasurement - KalmanState);
     KalmanUncertainty = (1.0f - KalmanGain) * KalmanUncertainty;
@@ -156,7 +153,7 @@ void reset_all_pid() {
 void pwmsetup() {
     ledc_timer_config_t ledc_timer = {
         .speed_mode = LEDC_HIGH_SPEED_MODE, .duty_resolution = LEDC_TIMER_12_BIT,
-        .timer_num = LEDC_TIMER_0, .freq_hz = 250, .clk_cfg = LEDC_AUTO_CLK
+        .timer_num = LEDC_TIMER_0, .freq_hz = 500, .clk_cfg = LEDC_AUTO_CLK // <-- 500 Hz
     };
     ledc_timer_config(&ledc_timer);
     ledc_channel_config_t ledc_channel[4] = {
@@ -169,8 +166,17 @@ void pwmsetup() {
 }
 
 void fast_pwmwrite(ledc_channel_t channel, int input_val) {
-    if(input_val > 4095) input_val = 4095;
-    ledc_set_duty(LEDC_HIGH_SPEED_MODE, channel, input_val);
+    // Keamanan sinyal
+    if(input_val > 2000) input_val = 2000;
+    
+    // Konversi duty cycle 12-bit untuk 500Hz
+    // Periode 500Hz = 2000 us. Maka 4096 / 2000 = 2.048
+    int duty_cycle = (int)(input_val * 2.048f);
+    
+    // Batas aman perangkat keras ESP32 (12-bit max = 4095)
+    if(duty_cycle > 4095) duty_cycle = 4095;
+    
+    ledc_set_duty(LEDC_HIGH_SPEED_MODE, channel, duty_cycle);
     LEDC.channel_group[0].channel[channel].conf1.duty_start = 1;
 }
 
@@ -186,7 +192,7 @@ void gyro_signals() {
     int16_t Mapped_AccX = -AccYLSB; int16_t Mapped_AccY = -AccXLSB; int16_t Mapped_AccZ = AccZLSB;
     int16_t Mapped_GyroX = GyroY;   int16_t Mapped_GyroY = GyroX;   int16_t Mapped_GyroZ = GyroZ;
 
-    const float LPF_FACTOR = 0.15f; 
+    const float LPF_FACTOR = 0.075f; 
     static float RateRoll_prev = 0, RatePitch_prev = 0, RateYaw_prev = 0;
 
     RateRoll  = (RateRoll_prev * (1.0f - LPF_FACTOR)) + (((float)Mapped_GyroX / 65.5f) * LPF_FACTOR);
@@ -235,7 +241,10 @@ void calibrate_sensor() {
 // ================================================================
 void flightControlTask(void *pvParameters) {
     uint32_t prev_inner_time = micros(), prev_outer_time = micros();
-    const uint32_t outer_interval_us = 20000; const uint32_t inner_interval_us = 4000;
+    
+    // Interval rasio 500Hz (Inner) dan 100Hz (Outer)
+    const uint32_t outer_interval_us = 10000; 
+    const uint32_t inner_interval_us = 2000;
 
     while(1) {
         uint32_t current_us = micros();
@@ -277,11 +286,10 @@ void flightControlTask(void *pvParameters) {
 
             InputThrottle = constrain(ReceiverValue[2], 1000, 2000);
                 
-            // --- MIXER MOTOR TELAH DIPERBAIKI (Sesuai Logika: Kanan +, Kiri -) ---
-            MotorInput1 = 1.024f * (InputThrottle - InputRoll - InputPitch - InputYaw); // Depan Kanan
-            MotorInput2 = 1.024f * (InputThrottle - InputRoll + InputPitch + InputYaw); // Belakang Kanan
-            MotorInput3 = 1.024f * (InputThrottle + InputRoll + InputPitch - InputYaw); // Belakang Kiri
-            MotorInput4 = 1.024f * (InputThrottle + InputRoll - InputPitch + InputYaw); // Depan Kiri
+            MotorInput1 = 1.024f * (InputThrottle - InputRoll - InputPitch - InputYaw); 
+            MotorInput2 = 1.024f * (InputThrottle - InputRoll + InputPitch + InputYaw); 
+            MotorInput3 = 1.024f * (InputThrottle + InputRoll + InputPitch - InputYaw); 
+            MotorInput4 = 1.024f * (InputThrottle + InputRoll - InputPitch + InputYaw); 
 
             MotorInput1 = constrain(MotorInput1, 1100, 1989); MotorInput2 = constrain(MotorInput2, 1100, 1989);
             MotorInput3 = constrain(MotorInput3, 1100, 1989); MotorInput4 = constrain(MotorInput4, 1100, 1989);
@@ -306,7 +314,6 @@ void telemetryTask(void *pvParameters) {
         myData.rx1 = ReceiverValue[0]; myData.rx2 = ReceiverValue[1]; myData.rx3 = ReceiverValue[2]; myData.rx4 = ReceiverValue[3];
         myData.roll  = KalmanAngleRoll; myData.pitch = KalmanAnglePitch;
         
-        // Ambil nilai Kp, Ki, Kd dari salah satu sumbu (karena disamakan)
         myData.P_Angle = pidAngleRoll.Kp; myData.I_Angle = pidAngleRoll.Ki; myData.D_Angle = pidAngleRoll.Kd;
         myData.P_Rate  = pidRateRoll.Kp;  myData.I_Rate  = pidRateRoll.Ki;  myData.D_Rate  = pidRateRoll.Kd;
         myData.P_Yaw   = pidRateYaw.Kp;   myData.I_Yaw   = pidRateYaw.Ki;   myData.D_Yaw   = pidRateYaw.Kd;
